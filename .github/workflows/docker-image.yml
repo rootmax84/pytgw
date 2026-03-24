@@ -1,0 +1,57 @@
+name: Docker Compose CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  test-compose:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check Docker versions
+        run: |
+          docker --version
+          docker compose version
+
+      - name: Validate docker-compose.yml
+        run: docker compose config
+
+      - name: Build services (no cache)
+        run: docker compose build --no-cache --pull
+
+      - name: Start services and check status
+        run: |
+          docker compose up -d
+          
+          echo "Waiting for app (pytgw) to become healthy..."
+          timeout 60s bash -c 'until [ "$(docker inspect -f {{.State.Health.Status}} pytgw)" = "healthy" ]; do sleep 2; echo -n "."; done'
+          echo ""
+          
+          if [ "$(docker inspect -f {{.State.Health.Status}} pytgw)" != "healthy" ]; then
+            echo "app (pytgw) did not become healthy in time"
+            docker compose logs app
+            exit 1
+          fi
+          
+          echo "Service status:"
+          docker compose ps
+          
+          echo "Testing health endpoint..."
+          curl -f http://localhost:9999/health || exit 1
+          echo "Health check passed"
+          
+          echo "All services are up and healthy"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose down --remove-orphans
+          docker system prune -f

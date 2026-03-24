@@ -1,0 +1,26 @@
+services:
+  app:
+    build: .
+    container_name: pytgw
+    volumes:
+      - ./app:/app
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "9999:8000"
+    environment:
+      - WORKERS=1
+      - PORT=8000
+      - LOG_LEVEL=info          # critical, error, warning, info, debug, trace
+      - DISABLE_ACCESS_LOG=true
+      - SOCKS_PROXY=            # ip:port, empty - direct connect
+      - TIMEOUT=30
+      - CONNECT_TIMEOUT=10
+      - USER_AGENT=PYTGW/1.0
+      - X_CONNECTION_ID=       # Expected X-Connection-Id header value, empty - skip validation
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "PORT=$${PORT:-8000}; curl -f http://localhost:$$PORT/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
