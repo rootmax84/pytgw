@@ -78,3 +78,29 @@ server {
     }
 }
 ```
+
+## Environment Variables
+or use this compose
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PORT` | Application port | `8000` |
+| `WORKERS` | Uvicorn workers count | `1` |
+| `LOG_LEVEL` | Logging level (critical, error, warning, info, debug, trace) | `info` |
+| `DISABLE_ACCESS_LOG` | Disable uvicorn access logs | `true` |
+| `SOCKS_PROXY` | SOCKS5 proxy (format: ip:port) | (empty) |
+| `TIMEOUT` | Request timeout in seconds | `30` |
+| `CONNECT_TIMEOUT` | Connection timeout in seconds | `10` |
+| `USER_AGENT` | Custom User-Agent header | `PYTGW/1.0` |
+| `X_CONNECTION_ID` | Security header that must be present in the client request | (empty) |
+
+## Testing
+```bash
+# Get bot information
+curl http://localhost:9999/bot<TOKEN>/getMe
+
+# Send a message
+curl -X POST http://localhost:9999/bot<TOKEN>/sendMessage \
+  -d "chat_id=123456789" \
+  -d "text=Hello from PYTGW"
+```
