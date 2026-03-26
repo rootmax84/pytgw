@@ -67,5 +67,11 @@ server {
         proxy_intercept_errors on;
         error_page 500 =500 /dummy_page.html; #empty/wrong X-Connection-Id
     }
+
+    error_page 500 /dummy_page.html;
+        location = /dummy_page.html {
+            root /config/www;
+            internal;
+    }
 }
 ```
