@@ -10,6 +10,7 @@ A lightweight, high-performance Telegram Bot API proxy/gateway written in Python
 -  **URL-Encoded Token Support** - Handles URL-encoded bot tokens in paths
 -  **File Upload Support** - Properly handles multipart/form-data file uploads (photos, documents, etc.)
 -  **SOCKS5 Proxy Support** - Route requests through SOCKS5 proxy
+-  **Masking** - Optional security header and dummy page for illegitimate requests
 -  **Token Masking** - Automatically removes bot tokens from logs for security
 -  **Async Performance** - Built with FastAPI and httpx for high concurrency
 -  **Health Check** - Built-in health check endpoint for container orchestration
