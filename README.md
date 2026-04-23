@@ -80,7 +80,6 @@ server {
 ```
 
 ## Environment Variables
-or use this compose
 
 | Variable | Description | Default |
 |----------|-------------|---------|
