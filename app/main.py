@@ -114,7 +114,15 @@ app.add_middleware(MaskTokenMiddleware)
 
 class TelegramApiMirror:
     def __init__(self, socks_proxy: Optional[str] = None):
-        self.socks_proxy = socks_proxy
+        # Store a normalized proxy URL (supports socks5://user:pass@host:port)
+        self.proxy_url = None
+        if socks_proxy and socks_proxy.strip():
+            proxy = socks_proxy.strip()
+            if not proxy.startswith(('socks5://', 'socks5h://')):
+                self.proxy_url = f"socks5://{proxy}"
+            else:
+                self.proxy_url = proxy
+
         self.timeout = TIMEOUT
         self.connect_timeout = CONNECT_TIMEOUT
         self.user_agent = USER_AGENT
@@ -170,14 +178,65 @@ class TelegramApiMirror:
                     continue
                 else:
                     logger.error(f"Connection timeout after {max_retries + 1} attempts")
-                    return self._send_error("Connection timeout", 504)
+                    return self._send_error(
+                        "Connection timeout: Telegram API is not reachable. "
+                        "Please check your network or proxy settings.",
+                        504
+                    )
             except httpx.ReadTimeout as e:
                 logger.error(f"Read timeout: {e}")
-                return self._send_error("Request timeout", 504)
+                return self._send_error(
+                    "Request timeout: Telegram API did not respond in time. "
+                    "Please try again later.",
+                    504
+                )
+            except httpx.ConnectError as e:
+                # Human-readable explanation of connection failures
+                # Some ConnectError instances may have an empty message
+                error_msg = mask_token_in_string(str(e)) if str(e) else "(no details)"
+                logger.error(f"ConnectError ({type(e).__name__}): {error_msg} | Full: {repr(e)}")
+                detail = self._analyze_connect_error(e) if str(e) else "Connection failed (no additional information available). Check network and proxy."
+                return self._send_error(detail, 502)
             except Exception as e:
                 error_msg = mask_token_in_string(str(e))
                 logger.error(f"Error sending request: {error_msg}", exc_info=True)
-                return self._send_error(str(e), 500)
+                return self._send_error(f"Unexpected error: {error_msg}", 500)
+
+    def _analyze_connect_error(self, exc: httpx.ConnectError) -> str:
+        """
+        Produce a user-friendly description for connection errors,
+        especially those involving the SOCKS proxy.
+        """
+        err_str = str(exc).lower()
+        if not err_str:
+            return (
+                "Connection failed unexpectedly. "
+                "Verify network connectivity and proxy settings."
+            )
+        if "socks" in err_str or "proxy" in err_str:
+            return (
+                "Cannot connect to Telegram via the configured SOCKS5 proxy. "
+                "Please verify that the proxy server is running, accessible, "
+                "and allows connections to api.telegram.org:443. "
+                "Check your SOCKS_PROXY environment variable."
+            )
+        elif "name resolution" in err_str or "getaddrinfo" in err_str:
+            return (
+                "DNS resolution failed. Check that the server can resolve "
+                "api.telegram.org or configure a working DNS."
+            )
+        elif "connection refused" in err_str:
+            return (
+                "Connection refused by the target server. "
+                "Telegram API may be temporarily unavailable or blocked."
+            )
+        elif "tls" in err_str or "ssl" in err_str:
+            return (
+                "TLS/SSL handshake failed. The proxy might be intercepting "
+                "traffic or the certificate is invalid."
+            )
+        else:
+            return f"Connection error: {exc}"
 
     async def _send_request(self, original_request: Request, telegram_url: str) -> httpx.Response:
         """Send request to Telegram API"""
@@ -229,11 +288,12 @@ class TelegramApiMirror:
             "follow_redirects": True
         }
 
-        if self.socks_proxy:
+        if self.proxy_url:
             client_kwargs["proxies"] = {
-                "http://": f"socks5://{self.socks_proxy}",
-                "https://": f"socks5://{self.socks_proxy}"
+                "http://": self.proxy_url,
+                "https://": self.proxy_url,
             }
+            logger.debug(f"Using proxy: {self.proxy_url}")
 
         async with httpx.AsyncClient(**client_kwargs) as client:
             if original_request.method == "GET":
