@@ -29,6 +29,7 @@ CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT", "10"))
 USER_AGENT = os.getenv("USER_AGENT", "PYTGW/1.0")
 DISABLE_ACCESS_LOG = os.getenv("DISABLE_ACCESS_LOG", "true").lower() == "true"
 X_CONNECTION_ID = os.getenv("X_CONNECTION_ID", "").strip()
+VERSION = "1.0.3"
 
 # Configure logging
 logging.basicConfig(
@@ -55,6 +56,19 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization", "X-Connection-Id"],
     allow_credentials=True,
 )
+
+# Startup event to log version and configuration
+@app.on_event("startup")
+async def startup_event():
+    logger.info(f"Starting Telegram API Gateway version {VERSION}")
+    if X_CONNECTION_ID:
+        logger.info("X-Connection-Id validation enabled")
+    else:
+        logger.info("X-Connection-Id validation disabled")
+    if SOCKS_PROXY:
+        logger.info(f"SOCKS5 proxy configured")
+    else:
+        logger.info("Direct connection (no proxy)")
 
 class ConnectionIdMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -192,7 +206,6 @@ class TelegramApiMirror:
                 )
             except httpx.ConnectError as e:
                 # Human-readable explanation of connection failures
-                # Some ConnectError instances may have an empty message
                 error_msg = mask_token_in_string(str(e)) if str(e) else "(no details)"
                 logger.error(f"ConnectError ({type(e).__name__}): {error_msg} | Full: {repr(e)}")
                 detail = self._analyze_connect_error(e) if str(e) else "Connection failed (no additional information available). Check network and proxy."
@@ -289,10 +302,7 @@ class TelegramApiMirror:
         }
 
         if self.proxy_url:
-            client_kwargs["proxies"] = {
-                "http://": self.proxy_url,
-                "https://": self.proxy_url,
-            }
+            client_kwargs["proxy"] = self.proxy_url
             logger.debug(f"Using proxy: {self.proxy_url}")
 
         async with httpx.AsyncClient(**client_kwargs) as client:
@@ -344,7 +354,12 @@ class TelegramApiMirror:
 # Health check endpoint
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "port": PORT, "connection_id_required": bool(X_CONNECTION_ID)}
+    return {
+        "status": "healthy",
+        "version": VERSION,
+        "port": PORT,
+        "connection_id_required": bool(X_CONNECTION_ID)
+    }
 
 # Main handler for all routes
 @app.api_route("/{path:path}", methods=["GET", "POST", "OPTIONS"])
@@ -362,19 +377,11 @@ async def bot_handler(request: Request, token: str, method: str):
 if __name__ == "__main__":
     import uvicorn
 
-    if X_CONNECTION_ID:
-        logger.info(f"X-Connection-Id validation enabled")
-    else:
-        logger.info("X-Connection-Id validation disabled")
-
-    if SOCKS_PROXY:
-        logger.info(f"SOCKS5 proxy configured: {SOCKS_PROXY}")
-    else:
-        logger.info("Direct connection (no proxy)")
-
+    # This block is not executed when run via `uvicorn main:app`,
+    # but is retained for compatibility with running python main.py directly.
     uvicorn.run(
-        app, 
-        host="0.0.0.0", 
+        app,
+        host="0.0.0.0",
         port=PORT,
         workers=WORKERS,
         log_level=LOG_LEVEL.lower(),
