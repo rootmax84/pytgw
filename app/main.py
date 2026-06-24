@@ -29,7 +29,7 @@ CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT", "10"))
 USER_AGENT = os.getenv("USER_AGENT", "PYTGW/1.0")
 DISABLE_ACCESS_LOG = os.getenv("DISABLE_ACCESS_LOG", "true").lower() == "true"
 X_CONNECTION_ID = os.getenv("X_CONNECTION_ID", "").strip()
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 
 # Configure logging
 logging.basicConfig(
@@ -83,16 +83,17 @@ class ConnectionIdMiddleware(BaseHTTPMiddleware):
         # Check if X-Connection-Id validation is required
         if X_CONNECTION_ID:
             connection_id = request.headers.get("X-Connection-Id")
+            client_ip = request.client.host if request.client else "unknown"
 
             # Log the received connection ID (masked for security)
             if connection_id:
-                logger.debug(f"Received X-Connection-Id header")
+                logger.debug(f"Received X-Connection-Id header from {client_ip}")
             else:
-                logger.warning(f"Missing X-Connection-Id header")
+                logger.warning(f"Missing X-Connection-Id header from {client_ip}")
 
             # Validate connection ID
             if not connection_id or connection_id != X_CONNECTION_ID:
-                logger.error(f"Invalid or missing X-Connection-Id header")
+                logger.error(f"Invalid or missing X-Connection-Id header from {client_ip}")
                 return PlainTextResponse(
                     status_code=500,
                     content="Internal server error"
@@ -109,7 +110,8 @@ class MaskTokenMiddleware(BaseHTTPMiddleware):
         if not DISABLE_ACCESS_LOG:
             original_path = request.url.path
             masked_path = remove_token_from_log(original_path)
-            logger.info(f"{request.method} {masked_path} - {response.status_code}")
+            client_ip = request.client.host if request.client else "unknown"
+            logger.info(f"{client_ip} - {request.method} {masked_path} - {response.status_code}")
 
         return response
 
@@ -173,7 +175,8 @@ class TelegramApiMirror:
 
         # Log with token removed
         log_url = remove_token_from_log(telegram_url)
-        logger.info(f"Proxying request to: {log_url}")
+        client_ip = request.client.host if request.client else "unknown"
+        logger.info(f"Proxying request from {client_ip} to: {log_url}")
 
         # Send request to Telegram with retry
         max_retries = 2
@@ -187,18 +190,18 @@ class TelegramApiMirror:
                 )
             except httpx.ConnectTimeout as e:
                 if attempt < max_retries:
-                    logger.warning(f"Connection timeout, retry {attempt + 1}/{max_retries} for {log_url}")
+                    logger.warning(f"Connection timeout from {client_ip}, retry {attempt + 1}/{max_retries} for {log_url}")
                     await asyncio.sleep(1)  # Wait 1 second before retry
                     continue
                 else:
-                    logger.error(f"Connection timeout after {max_retries + 1} attempts")
+                    logger.error(f"Connection timeout from {client_ip} after {max_retries + 1} attempts")
                     return self._send_error(
                         "Connection timeout: Telegram API is not reachable. "
                         "Please check your network or proxy settings.",
                         504
                     )
             except httpx.ReadTimeout as e:
-                logger.error(f"Read timeout: {e}")
+                logger.error(f"Read timeout from {client_ip}: {e}")
                 return self._send_error(
                     "Request timeout: Telegram API did not respond in time. "
                     "Please try again later.",
@@ -207,12 +210,12 @@ class TelegramApiMirror:
             except httpx.ConnectError as e:
                 # Human-readable explanation of connection failures
                 error_msg = mask_token_in_string(str(e)) if str(e) else "(no details)"
-                logger.error(f"ConnectError ({type(e).__name__}): {error_msg} | Full: {repr(e)}")
+                logger.error(f"ConnectError from {client_ip} ({type(e).__name__}): {error_msg} | Full: {repr(e)}")
                 detail = self._analyze_connect_error(e) if str(e) else "Connection failed (no additional information available). Check network and proxy."
                 return self._send_error(detail, 502)
             except Exception as e:
                 error_msg = mask_token_in_string(str(e))
-                logger.error(f"Error sending request: {error_msg}", exc_info=True)
+                logger.error(f"Error from {client_ip} sending request: {error_msg}", exc_info=True)
                 return self._send_error(f"Unexpected error: {error_msg}", 500)
 
     def _analyze_connect_error(self, exc: httpx.ConnectError) -> str:
