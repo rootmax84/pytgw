@@ -92,6 +92,7 @@ server {
 | `CONNECT_TIMEOUT` | Connection timeout in seconds | `10` |
 | `USER_AGENT` | Custom User-Agent header | `PYTGW/1.0` |
 | `X_CONNECTION_ID` | Security header that must be present in the client request | (empty) |
+| `TRUSTED_PROXIES` | Trusted proxies comma-separated allowed to set forwarded host, proto, client ip headers | (empty) |
 
 ## Testing
 ```bash
