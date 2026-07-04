@@ -7,6 +7,7 @@ import re
 import json
 import logging
 import asyncio
+import ipaddress
 from typing import Optional, Dict, Any
 from urllib.parse import parse_qs, urlparse, unquote, urlencode
 
@@ -31,13 +32,33 @@ DISABLE_ACCESS_LOG = os.getenv("DISABLE_ACCESS_LOG", "true").lower() == "true"
 X_CONNECTION_ID = os.getenv("X_CONNECTION_ID", "").strip()
 VERSION = "1.0.5"
 
-# Trusted proxies for real client IP extraction (comma-separated list)
-TRUSTED_PROXIES = set(
-    ip.strip() for ip in os.getenv("TRUSTED_PROXIES", "").split(",") if ip.strip()
-)
-# Default to localhost if not configured
-if not TRUSTED_PROXIES:
-    TRUSTED_PROXIES = {"127.0.0.1", "::1"}
+# Trusted proxies configuration (supports CIDR masks, e.g., 172.19.0.1/16)
+TRUSTED_PROXIES_RAW = os.getenv("TRUSTED_PROXIES", "")
+TRUSTED_NETWORKS = []
+
+if TRUSTED_PROXIES_RAW.strip():
+    for entry in TRUSTED_PROXIES_RAW.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            if '/' in entry:
+                net = ipaddress.ip_network(entry, strict=False)
+            else:
+                addr = ipaddress.ip_address(entry)
+                if isinstance(addr, ipaddress.IPv4Address):
+                    net = ipaddress.IPv4Network(f"{entry}/32", strict=False)
+                else:
+                    net = ipaddress.IPv6Network(f"{entry}/128", strict=False)
+            TRUSTED_NETWORKS.append(net)
+        except ValueError as e:
+            logging.warning(f"Invalid trusted proxy entry '{entry}': {e}")
+else:
+    # Default: localhost (IPv4 and IPv6)
+    TRUSTED_NETWORKS = [
+        ipaddress.IPv4Network("127.0.0.1/32"),
+        ipaddress.IPv6Network("::1/128")
+    ]
 
 # Configure logging
 logging.basicConfig(
@@ -77,29 +98,40 @@ async def startup_event():
         logger.info(f"SOCKS5 proxy configured")
     else:
         logger.info("Direct connection (no proxy)")
-    # Log trusted proxies
-    logger.info(f"Trusted proxy IPs: {', '.join(TRUSTED_PROXIES)}")
+    # Log trusted proxy networks
+    nets_str = ", ".join(str(net) for net in TRUSTED_NETWORKS)
+    logger.info(f"Trusted proxy networks: {nets_str}")
 
 class RealClientIPMiddleware(BaseHTTPMiddleware):
     """
     Replaces the client IP in request.scope with the real client IP
     extracted from X-Forwarded-For or X-Real-IP headers when the
-    immediate connection comes from a trusted proxy.
+    immediate connection comes from a trusted proxy (supports CIDR).
     """
     async def dispatch(self, request: Request, call_next):
         client_host = request.client.host if request.client else None
-
-        if client_host in TRUSTED_PROXIES:
-            forwarded_for = request.headers.get("X-Forwarded-For")
-            if forwarded_for:
-                # The first IP is the original client
-                real_ip = forwarded_for.split(",")[0].strip()
-                request.scope["client"] = (real_ip, request.client.port if request.client else 0)
-            else:
-                real_ip = request.headers.get("X-Real-IP")
-                if real_ip:
-                    request.scope["client"] = (real_ip, request.client.port if request.client else 0)
-
+        if client_host:
+            try:
+                client_ip = ipaddress.ip_address(client_host)
+                if any(client_ip in net for net in TRUSTED_NETWORKS):
+                    forwarded_for = request.headers.get("X-Forwarded-For")
+                    if forwarded_for:
+                        real_ip_str = forwarded_for.split(",")[0].strip()
+                        try:
+                            ipaddress.ip_address(real_ip_str)  # validate
+                            request.scope["client"] = (real_ip_str, request.client.port if request.client else 0)
+                        except ValueError:
+                            pass
+                    else:
+                        real_ip_str = request.headers.get("X-Real-IP")
+                        if real_ip_str:
+                            try:
+                                ipaddress.ip_address(real_ip_str)
+                                request.scope["client"] = (real_ip_str, request.client.port if request.client else 0)
+                            except ValueError:
+                                pass
+            except ValueError:
+                pass  # client_host is not a valid IP address
         response = await call_next(request)
         return response
 
