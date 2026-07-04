@@ -29,7 +29,15 @@ CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT", "10"))
 USER_AGENT = os.getenv("USER_AGENT", "PYTGW/1.0")
 DISABLE_ACCESS_LOG = os.getenv("DISABLE_ACCESS_LOG", "true").lower() == "true"
 X_CONNECTION_ID = os.getenv("X_CONNECTION_ID", "").strip()
-VERSION = "1.0.4"
+VERSION = "1.0.5"
+
+# Trusted proxies for real client IP extraction (comma-separated list)
+TRUSTED_PROXIES = set(
+    ip.strip() for ip in os.getenv("TRUSTED_PROXIES", "").split(",") if ip.strip()
+)
+# Default to localhost if not configured
+if not TRUSTED_PROXIES:
+    TRUSTED_PROXIES = {"127.0.0.1", "::1"}
 
 # Configure logging
 logging.basicConfig(
@@ -69,6 +77,31 @@ async def startup_event():
         logger.info(f"SOCKS5 proxy configured")
     else:
         logger.info("Direct connection (no proxy)")
+    # Log trusted proxies
+    logger.info(f"Trusted proxy IPs: {', '.join(TRUSTED_PROXIES)}")
+
+class RealClientIPMiddleware(BaseHTTPMiddleware):
+    """
+    Replaces the client IP in request.scope with the real client IP
+    extracted from X-Forwarded-For or X-Real-IP headers when the
+    immediate connection comes from a trusted proxy.
+    """
+    async def dispatch(self, request: Request, call_next):
+        client_host = request.client.host if request.client else None
+
+        if client_host in TRUSTED_PROXIES:
+            forwarded_for = request.headers.get("X-Forwarded-For")
+            if forwarded_for:
+                # The first IP is the original client
+                real_ip = forwarded_for.split(",")[0].strip()
+                request.scope["client"] = (real_ip, request.client.port if request.client else 0)
+            else:
+                real_ip = request.headers.get("X-Real-IP")
+                if real_ip:
+                    request.scope["client"] = (real_ip, request.client.port if request.client else 0)
+
+        response = await call_next(request)
+        return response
 
 class ConnectionIdMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -119,12 +152,13 @@ def remove_token_from_log(text: str) -> str:
     pattern = r'/bot\d+:[A-Za-z0-9_\-]+/'
     return re.sub(pattern, '/bot[TOKEN_REMOVED]/', text)
 
-
 def mask_token_in_string(text: str) -> str:
     pattern = r'bot\d+:[A-Za-z0-9_\-]+'
     return re.sub(pattern, 'bot[TOKEN_REMOVED]', text)
 
-# Add middlewares (order matters - ConnectionIdMiddleware should be first)
+# Add middlewares – order matters:
+# RealClientIPMiddleware must be first to set the real IP for all others
+app.add_middleware(RealClientIPMiddleware)
 app.add_middleware(ConnectionIdMiddleware)
 app.add_middleware(MaskTokenMiddleware)
 
