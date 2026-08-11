@@ -30,7 +30,7 @@ CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT", "10"))
 USER_AGENT = os.getenv("USER_AGENT", "PYTGW/1.0")
 DISABLE_ACCESS_LOG = os.getenv("DISABLE_ACCESS_LOG", "true").lower() == "true"
 X_CONNECTION_ID = os.getenv("X_CONNECTION_ID", "").strip()
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 
 # Trusted proxies configuration (supports CIDR masks, e.g., 172.19.0.1/16)
 TRUSTED_PROXIES_RAW = os.getenv("TRUSTED_PROXIES", "")
@@ -326,34 +326,52 @@ class TelegramApiMirror:
         # Get query parameters from original URL
         query_params = dict(original_request.query_params)
 
-        # Prepare data and files from body
+        # Prepare data, files, and JSON payload based on content type
         data = {}
         files = []
+        json_payload = None
+        raw_body = None
 
         if original_request.method == "POST":
-            # Use request.form() which properly handles multipart
-            try:
-                form = await original_request.form()
+            # Read the raw body first to avoid losing it
+            raw_body = await original_request.body()
+            content_type = original_request.headers.get("content-type", "")
 
-                for key, value in form.items():
-                    if hasattr(value, 'filename') and value.filename:
-                        # This is a file
-                        content = await value.read()
-                        files.append(
-                            (key, (value.filename, content, value.content_type))
-                        )
-                        logger.debug(f"FILE: {key} = {value.filename} ({len(content)} bytes)")
-                    else:
-                        # This is a regular field
-                        data[key] = value
-                        logger.debug(f"FIELD: {key} = {value}")
-            except Exception as e:
-                logger.error(f"Error parsing form: {e}", exc_info=True)
+            if "application/json" in content_type and raw_body:
+                # Forward as JSON – fixes /setMyCommands and other JSON methods
+                try:
+                    json_payload = json.loads(raw_body)
+                    logger.debug(f"JSON payload: {mask_token_in_string(raw_body.decode()[:200])}")
+                except json.JSONDecodeError as e:
+                    logger.error(f"Invalid JSON from client: {e}")
+                    return self._send_error("Invalid JSON in request body", 400)
+            elif raw_body:
+                # Try to parse as form/multipart, fallback to raw otherwise
+                try:
+                    form = await original_request.form()
+                    for key, value in form.items():
+                        if hasattr(value, 'filename') and value.filename:
+                            # This is a file
+                            content = await value.read()
+                            files.append(
+                                (key, (value.filename, content, value.content_type))
+                            )
+                            logger.debug(f"FILE: {key} = {value.filename} ({len(content)} bytes)")
+                        else:
+                            # This is a regular field
+                            data[key] = value
+                            logger.debug(f"FIELD: {key} = {value}")
+                except Exception:
+                    # Not a standard form – pass raw body as content
+                    logger.warning("Could not parse form, sending raw body as-is")
+                    data = raw_body
 
         # Log what we're sending
         logger.debug(f"Query params: {query_params}")
-        logger.debug(f"Data fields: {list(data.keys())}")
+        logger.debug(f"Data fields: {list(data.keys()) if isinstance(data, dict) else 'raw'}")
         logger.debug(f"File fields: {[f[0] for f in files]}")
+        if json_payload is not None:
+            logger.debug(f"JSON keys: {list(json_payload.keys()) if isinstance(json_payload, dict) else 'scalar'}")
 
         # Configure client with separate timeouts
         timeout_config = httpx.Timeout(
@@ -377,32 +395,26 @@ class TelegramApiMirror:
         async with httpx.AsyncClient(**client_kwargs) as client:
             if original_request.method == "GET":
                 response = await client.get(telegram_url, params=query_params)
-            elif files:
-                # POST with files
-                if query_params:
-                    final_url = f"{telegram_url}?{urlencode(query_params)}"
-                else:
-                    final_url = telegram_url
-
-                logger.debug(f"Sending POST with {len(files)} file(s)")
-                response = await client.post(final_url, data=data, files=files)
-            elif data:
-                # POST with data only
-                if query_params:
-                    final_url = f"{telegram_url}?{urlencode(query_params)}"
-                else:
-                    final_url = telegram_url
-
-                logger.debug(f"Sending POST with data only")
-                response = await client.post(final_url, data=data)
             else:
-                # POST without data
+                # Build final URL with remaining query params (if any)
                 if query_params:
                     final_url = f"{telegram_url}?{urlencode(query_params)}"
                 else:
                     final_url = telegram_url
 
-                response = await client.post(final_url)
+                if files:
+                    # POST with files (multipart)
+                    response = await client.post(final_url, data=data, files=files)
+                elif json_payload is not None:
+                    # POST as JSON
+                    response = await client.post(final_url, json=json_payload)
+                elif isinstance(data, dict) and data:
+                    # POST with form fields
+                    response = await client.post(final_url, data=data)
+                else:
+                    # POST without data or with raw body
+                    content = data if not isinstance(data, dict) else None
+                    response = await client.post(final_url, content=content)
 
             logger.debug(f"Response status: {response.status_code}")
             if response.status_code != 200:
@@ -456,3 +468,4 @@ if __name__ == "__main__":
         log_level=LOG_LEVEL.lower(),
         access_log=not DISABLE_ACCESS_LOG,
     )
+    
