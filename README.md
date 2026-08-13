@@ -1,3 +1,7 @@
+<p align="center" width="100%">
+<img width="20%" alt="pytgw_logo_3" src="https://github.com/user-attachments/assets/035847d2-d8db-4638-8923-314c274e6c93" />
+</p>
+
 # PYTGW - Telegram API Gateway
 
 ![CI History](https://img.shields.io/github/actions/workflow/status/rootmax84/pytgw/.github/workflows/docker-image.yml?branch=main&label=build%20history&style=flat-round)
