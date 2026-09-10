@@ -47,6 +47,9 @@ services:
       - CONNECT_TIMEOUT=10
       - USER_AGENT=PYTGW/1.0
       - X_CONNECTION_ID=
+      - TRUSTED_PROXIES=
+      - MAX_CONCURRENT_REQUESTS=100
+      - MAX_KEEPALIVE_CONNECTIONS=10
     restart: always
     healthcheck:
       test: ["CMD-SHELL", "PORT=$${PORT:-8000}; curl -f http://localhost:$$PORT/health || exit 1"]
@@ -97,6 +100,8 @@ server {
 | `USER_AGENT` | Custom User-Agent header | `PYTGW/1.0` |
 | `X_CONNECTION_ID` | Security header that must be present in the client request | (empty) |
 | `TRUSTED_PROXIES` | Trusted proxies comma-separated allowed to set forwarded host, proto, client ip headers | (empty) |
+| `MAX_CONCURRENT_REQUESTS` | How many simultaneous outgoing requests to Telegram | `200` |
+| `MAX_KEEPALIVE_CONNECTIONS` | How many keep-alive connections to keep | `50` |
 
 ## Testing
 ```bash
