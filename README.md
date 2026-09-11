@@ -3,8 +3,7 @@
 </p>
 
 # PYTGW - Telegram API Gateway
-
-![CI History](https://img.shields.io/github/actions/workflow/status/rootmax84/pytgw/.github/workflows/docker-image.yml?branch=main&label=build%20history&style=flat-round) [![Vulnerabilities](https://sonarcloud.io/api/project_badges/measure?project=rootmax84_pytgw&metric=vulnerabilities)](https://sonarcloud.io/summary/new_code?id=rootmax84_pytgw) [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=rootmax84_pytgw&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=rootmax84_pytgw)
+[![Docker Publish](https://img.shields.io/github/actions/workflow/status/rootmax84/pytgw/.github/workflows/docker-publish.yml?branch=main&label=docker%20publish&style=flat-round)](https://github.com/rootmax84/pytgw/actions/workflows/docker-publish.yml) ![CI History](https://img.shields.io/github/actions/workflow/status/rootmax84/pytgw/.github/workflows/docker-image.yml?branch=main&label=build%20history&style=flat-round) [![Vulnerabilities](https://sonarcloud.io/api/project_badges/measure?project=rootmax84_pytgw&metric=vulnerabilities)](https://sonarcloud.io/summary/new_code?id=rootmax84_pytgw) [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=rootmax84_pytgw&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=rootmax84_pytgw)
 
 A lightweight, high-performance Telegram Bot API proxy/gateway written in Python. It acts as a reverse proxy for Telegram Bot API requests, supporting both direct and SOCKS5 proxy connections.
 
