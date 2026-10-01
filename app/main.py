@@ -31,11 +31,15 @@ CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT", "10"))
 USER_AGENT = os.getenv("USER_AGENT", "PYTGW/1.0")
 DISABLE_ACCESS_LOG = os.getenv("DISABLE_ACCESS_LOG", "true").lower() == "true"
 X_CONNECTION_ID = os.getenv("X_CONNECTION_ID", "").strip()
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Concurrency & connection pool tuning
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "200"))
 MAX_KEEPALIVE_CONNECTIONS = int(os.getenv("MAX_KEEPALIVE_CONNECTIONS", "50"))
+
+# Maximum allowed request body size (in bytes). Default: 20 MiB.
+# Telegram's bot API caps file uploads at ~20 MiB for most methods.
+MAX_REQUEST_BODY_SIZE = int(os.getenv("MAX_REQUEST_BODY_SIZE", str(20 * 1024 * 1024)))
 
 # ---------------- Trusted proxies (CIDR-aware) ----------------
 TRUSTED_PROXIES_RAW = os.getenv("TRUSTED_PROXIES", "")
@@ -59,6 +63,7 @@ if TRUSTED_PROXIES_RAW.strip():
         except ValueError as e:
             logging.warning(f"Invalid trusted proxy entry '{entry}': {e}")
 else:
+    # Default: only localhost is trusted.
     TRUSTED_NETWORKS = [
         ipaddress.IPv4Network("127.0.0.1/32"),
         ipaddress.IPv6Network("::1/128"),
@@ -71,6 +76,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Silence noisy third-party loggers.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -81,22 +87,33 @@ if DISABLE_ACCESS_LOG:
 
 # ---------------- Helpers ----------------
 def remove_token_from_log(text: str) -> str:
+    """Replace the bot token in a URL/path with a placeholder for safe logging."""
     pattern = r'/bot\d+:[A-Za-z0-9_\-]+/'
     return re.sub(pattern, '/bot[TOKEN_REMOVED]/', text)
 
 
 def mask_token_in_string(text: str) -> str:
+    """Replace any bot token appearing anywhere in a string with a placeholder."""
     pattern = r'bot\d+:[A-Za-z0-9_\-]+'
     return re.sub(pattern, 'bot[TOKEN_REMOVED]', text)
 
 
 def normalize_proxy_url(proxy: str) -> str:
+    """Normalize a SOCKS proxy string into a full URL with a scheme."""
     proxy = (proxy or "").strip()
     if not proxy:
         return ""
     if not proxy.startswith(("socks5://", "socks5h://")):
         return f"socks5://{proxy}"
     return proxy
+
+
+def is_valid_bot_token(token: str) -> bool:
+    """
+    Validate the shape of a Telegram bot token.
+    Format: <digits>:<alphanumeric_with_dashes_and_underscores>
+    """
+    return bool(re.match(r'^\d+:[A-Za-z0-9_\-]+$', token))
 
 
 # ---------------- Middleware ----------------
@@ -139,7 +156,12 @@ class RealClientIPMiddleware(BaseHTTPMiddleware):
 
 
 class ConnectionIdMiddleware(BaseHTTPMiddleware):
+    """
+    Enforces the X-Connection-Id header when X_CONNECTION_ID is configured.
+    Returns 403 Forbidden on mismatch/missing header (semantically correct).
+    """
     async def dispatch(self, request: Request, call_next):
+        # Preflight and health checks bypass the header check.
         if request.method == "OPTIONS":
             return await call_next(request)
 
@@ -157,15 +179,55 @@ class ConnectionIdMiddleware(BaseHTTPMiddleware):
 
             if not connection_id or connection_id != X_CONNECTION_ID:
                 logger.error(f"Invalid or missing X-Connection-Id header from {client_ip}")
+                # 403 Forbidden is more accurate than 500 for auth failures.
                 return PlainTextResponse(
-                    status_code=500,
-                    content="Internal server error",
+                    status_code=403,
+                    content="Forbidden: invalid or missing X-Connection-Id",
                 )
 
         return await call_next(request)
 
 
+class BodySizeLimitMiddleware(BaseHTTPMiddleware):
+    """
+    Rejects requests whose declared body size exceeds MAX_REQUEST_BODY_SIZE.
+
+    Uses Content-Length when available. Chunked requests without a
+    Content-Length header are not blocked here; the underlying
+    httpx client and Starlette form parsing will still stream them.
+    """
+    async def dispatch(self, request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_REQUEST_BODY_SIZE:
+                    logger.warning(
+                        f"Rejecting request from "
+                        f"{request.client.host if request.client else 'unknown'}: "
+                        f"body too large ({content_length} bytes)"
+                    )
+                    return JSONResponse(
+                        status_code=413,
+                        content={
+                            "ok": False,
+                            "error_code": 413,
+                            "description": (
+                                f"Request body too large. Maximum allowed: "
+                                f"{MAX_REQUEST_BODY_SIZE} bytes."
+                            ),
+                        },
+                    )
+            except ValueError:
+                # Malformed Content-Length header; let downstream handle it.
+                pass
+        return await call_next(request)
+
+
 class MaskTokenMiddleware(BaseHTTPMiddleware):
+    """
+    Logs requests with tokens masked and (optionally) preserves uvicorn
+    access log behavior.
+    """
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
 
@@ -195,11 +257,20 @@ class TelegramApiMirror:
         token: Optional[str] = None
         method: Optional[str] = None
 
+        # Try /bot<token>/<method> first.
         match = re.match(r'^/bot([^/]+)/([^/?]+)', path)
         if match:
             token = unquote(match.group(1))
             method = match.group(2)
+            # Validate token shape before forwarding to Telegram.
+            if not is_valid_bot_token(token):
+                logger.warning(
+                    f"Rejecting request with malformed bot token from "
+                    f"{request.client.host if request.client else 'unknown'}"
+                )
+                return self._send_error("Invalid bot token format", 400)
         else:
+            # Fall back to a bare method path, e.g. /getMe (rare, for tests).
             match = re.match(r'^/([^/?]+)$', path)
             if match:
                 method = match.group(1)
@@ -273,10 +344,11 @@ class TelegramApiMirror:
                     )
                     return self._send_error(f"Unexpected error: {error_msg}", 500)
 
-        # Unreachable, kept for type checkers
+        # Unreachable, kept for type checkers.
         return self._send_error("Unexpected error", 500)
 
     def _analyze_connect_error(self, exc: httpx.ConnectError) -> str:
+        """Map a ConnectError to a human-readable diagnostic message."""
         err_str = str(exc).lower()
         if not err_str:
             return (
@@ -310,8 +382,10 @@ class TelegramApiMirror:
     async def _send_request(
         self, original_request: Request, telegram_url: str
     ) -> httpx.Response:
+        """Forward the incoming request to Telegram and return the httpx response."""
         client: httpx.AsyncClient = original_request.app.state.http_client
 
+        # Preserve query string parameters (e.g. ?offset=... for getUpdates).
         query_params = dict(original_request.query_params)
 
         data: Dict[str, Any] = {}
@@ -349,6 +423,7 @@ class TelegramApiMirror:
 
                 for key, value in form.items():
                     if hasattr(value, "filename") and value.filename:
+                        # UploadedFile-like: prefer streaming from the underlying file.
                         file_obj = getattr(value, "file", None)
                         if file_obj is not None:
                             try:
@@ -362,6 +437,7 @@ class TelegramApiMirror:
                                 f"FILE: {key} = {value.filename} (streamed)"
                             )
                         else:
+                            # Small in-memory file.
                             file_bytes = await value.read()
                             files.append(
                                 (key, (value.filename, file_bytes, value.content_type))
@@ -375,7 +451,7 @@ class TelegramApiMirror:
                         logger.debug(f"FIELD: {key} = {value}")
 
             else:
-                # Unknown content-type: pass the raw body through.
+                # Unknown content-type: pass the raw body through untouched.
                 content = await original_request.body()
 
         logger.debug(f"Query params: {query_params}")
@@ -396,6 +472,7 @@ class TelegramApiMirror:
         if original_request.method == "GET":
             response = await client.get(telegram_url, params=query_params)
         else:
+            # Append query params to URL for POST requests.
             if query_params:
                 final_url = f"{telegram_url}?{urlencode(query_params)}"
             else:
@@ -417,6 +494,7 @@ class TelegramApiMirror:
         return response
 
     def _send_error(self, message: str, code: int = 404) -> JSONResponse:
+        """Return a Telegram-style error JSON response."""
         return JSONResponse(
             status_code=code,
             content={
@@ -427,7 +505,7 @@ class TelegramApiMirror:
         )
 
 
-# Module-level singleton (mirror holds no per-request state)
+# Module-level singleton (mirror holds no per-request state).
 telegram_mirror = TelegramApiMirror()
 
 
@@ -443,6 +521,7 @@ async def lifespan(app: FastAPI):
 
     nets_str = ", ".join(str(net) for net in TRUSTED_NETWORKS)
     logger.info(f"Trusted proxy networks: {nets_str}")
+    logger.info(f"Max request body size: {MAX_REQUEST_BODY_SIZE} bytes")
 
     timeout_config = httpx.Timeout(
         timeout=TIMEOUT,
@@ -451,8 +530,11 @@ async def lifespan(app: FastAPI):
         write=TIMEOUT,
     )
 
+    # Connection pool sizing:
+    #   max_connections  = concurrency budget + keep-alive headroom
+    #   max_keepalive    = keep idle sockets warm for reuse
     limits = httpx.Limits(
-        max_connections=max(MAX_CONCURRENT_REQUESTS * 2, 100),
+        max_connections=MAX_CONCURRENT_REQUESTS + MAX_KEEPALIVE_CONNECTIONS,
         max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
     )
 
@@ -503,8 +585,14 @@ app.add_middleware(
     allow_credentials=True,
 )
 
-# Order preserved from the original code (last added = outermost)
+# Middleware order: last added is outermost.
+# Execution order (outermost -> innermost):
+#   1. MaskTokenMiddleware   (logging)
+#   2. ConnectionIdMiddleware (auth gate)
+#   3. BodySizeLimitMiddleware (DoS guard)
+#   4. RealClientIPMiddleware  (rewrites client IP)
 app.add_middleware(RealClientIPMiddleware)
+app.add_middleware(BodySizeLimitMiddleware)
 app.add_middleware(ConnectionIdMiddleware)
 app.add_middleware(MaskTokenMiddleware)
 
@@ -520,14 +608,17 @@ async def health_check():
     }
 
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "OPTIONS"])
-async def catch_all(request: Request, path: str):
-    return await telegram_mirror.handle_request(request)
-
-
+# Declared BEFORE catch_all so FastAPI matches it first.
+# Route order in FastAPI follows declaration order.
 @app.post("/bot/{token}/{method}")
 @app.get("/bot/{token}/{method}")
 async def bot_handler(request: Request, token: str, method: str):
+    return await telegram_mirror.handle_request(request)
+
+
+# Catch-all: registered last so it only handles unmatched paths.
+@app.api_route("/{path:path}", methods=["GET", "POST", "OPTIONS"])
+async def catch_all(request: Request, path: str):
     return await telegram_mirror.handle_request(request)
 
 
