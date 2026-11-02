@@ -12,7 +12,7 @@ services:
       - PORT=8000
       - LOG_LEVEL=info          # critical, error, warning, info, debug, trace
       - DISABLE_ACCESS_LOG=true
-      - SOCKS_PROXY=192.168.88.2:10808           # ip:port, empty - direct connect
+      - SOCKS_PROXY=           # ip:port, empty - direct connect
       - TIMEOUT=30
       - CONNECT_TIMEOUT=10
       - USER_AGENT=PYTGW/1.0
@@ -20,6 +20,13 @@ services:
       - TRUSTED_PROXIES=       # Trusted proxies comma-separated allowed to set forwarded host, proto, client ip
       - MAX_CONCURRENT_REQUESTS=100
       - MAX_KEEPALIVE_CONNECTIONS=10
+      - MAX_REQUEST_BODY_SIZE=20971520   # 20 MiB
+      - MAX_RETRIES=2
+      - RETRY_BASE_DELAY=0.5
+      - RETRY_MAX_DELAY=5.0
+      - ENABLE_DOCS=false                # set to true to expose /docs, /redoc, /openapi.json
+      - CORS_ALLOW_ORIGINS=*             # comma-separated list or "*"
+      - CORS_ALLOW_CREDENTIALS=false     # must be false when origins is "*"
 
     restart: always
     healthcheck:

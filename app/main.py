@@ -8,8 +8,10 @@ import json
 import logging
 import asyncio
 import ipaddress
+import secrets
+import random
 from contextlib import asynccontextmanager
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 from urllib.parse import urlparse, unquote, urlencode
 
 import httpx
@@ -31,7 +33,12 @@ CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT", "10"))
 USER_AGENT = os.getenv("USER_AGENT", "PYTGW/1.0")
 DISABLE_ACCESS_LOG = os.getenv("DISABLE_ACCESS_LOG", "true").lower() == "true"
 X_CONNECTION_ID = os.getenv("X_CONNECTION_ID", "").strip()
-VERSION = "1.2.0"
+VERSION = "1.2.1"
+
+# OpenAPI/Swagger/ReDoc endpoints are disabled by default. They
+# reveal the gateway's routing structure to unauthenticated clients and
+# are not needed in production. Set ENABLE_DOCS=true to re-enable.
+ENABLE_DOCS = os.getenv("ENABLE_DOCS", "false").lower() == "true"
 
 # Concurrency & connection pool tuning
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "200"))
@@ -40,6 +47,26 @@ MAX_KEEPALIVE_CONNECTIONS = int(os.getenv("MAX_KEEPALIVE_CONNECTIONS", "50"))
 # Maximum allowed request body size (in bytes). Default: 20 MiB.
 # Telegram's bot API caps file uploads at ~20 MiB for most methods.
 MAX_REQUEST_BODY_SIZE = int(os.getenv("MAX_REQUEST_BODY_SIZE", str(20 * 1024 * 1024)))
+
+# retry tuning. Exponential backoff with full jitter avoids the
+# "thundering herd" pattern when Telegram has a brief outage.
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
+RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "0.5"))
+RETRY_MAX_DELAY = float(os.getenv("RETRY_MAX_DELAY", "5.0"))
+
+# CORS is now configurable via env. The previous hard-coded
+# `allow_origins=["*"]` + `allow_credentials=True` combination is invalid
+# per the CORS spec — browsers reject it. We keep the wildcard default but
+# disable credentials, and expose both knobs for operators who need them.
+CORS_ALLOW_ORIGINS_RAW = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
+CORS_ALLOW_ORIGINS = (
+    ["*"]
+    if CORS_ALLOW_ORIGINS_RAW == "*"
+    else [o.strip() for o in CORS_ALLOW_ORIGINS_RAW.split(",") if o.strip()]
+)
+CORS_ALLOW_CREDENTIALS = (
+    os.getenv("CORS_ALLOW_CREDENTIALS", "false").lower() == "true"
+)
 
 # ---------------- Trusted proxies (CIDR-aware) ----------------
 TRUSTED_PROXIES_RAW = os.getenv("TRUSTED_PROXIES", "")
@@ -80,9 +107,11 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-if DISABLE_ACCESS_LOG:
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.error").setLevel(logging.INFO)
+# uvicorn's default access logger prints the raw URL path, which
+# leaks the bot token into logs. Always silence it. Access logging is
+# handled by MaskTokenMiddleware below, which masks tokens before logging.
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.error").setLevel(logging.INFO)
 
 
 # ---------------- Helpers ----------------
@@ -114,6 +143,16 @@ def is_valid_bot_token(token: str) -> bool:
     Format: <digits>:<alphanumeric_with_dashes_and_underscores>
     """
     return bool(re.match(r'^\d+:[A-Za-z0-9_\-]+$', token))
+
+
+def _compute_backoff(attempt: int) -> float:
+    """
+    Exponential backoff with full jitter.
+    Returns a random delay in [0, min(base * 2**attempt, max_delay)].
+    """
+    exp = RETRY_BASE_DELAY * (2 ** attempt)
+    capped = min(exp, RETRY_MAX_DELAY)
+    return random.uniform(0, capped)
 
 
 # ---------------- Middleware ----------------
@@ -177,8 +216,23 @@ class ConnectionIdMiddleware(BaseHTTPMiddleware):
             else:
                 logger.warning(f"Missing X-Connection-Id header from {client_ip}")
 
-            if not connection_id or connection_id != X_CONNECTION_ID:
-                logger.error(f"Invalid or missing X-Connection-Id header from {client_ip}")
+            # constant-time comparison to prevent timing attacks
+            # on the shared secret. Both sides are encoded to bytes first,
+            # so non-ASCII inputs simply fail the match rather than crash.
+            matches = False
+            if connection_id:
+                try:
+                    matches = secrets.compare_digest(
+                        connection_id.encode("utf-8"),
+                        X_CONNECTION_ID.encode("utf-8"),
+                    )
+                except (TypeError, ValueError):
+                    matches = False
+
+            if not matches:
+                logger.error(
+                    f"Invalid or missing X-Connection-Id header from {client_ip}"
+                )
                 # 403 Forbidden is more accurate than 500 for auth failures.
                 return PlainTextResponse(
                     status_code=403,
@@ -290,26 +344,34 @@ class TelegramApiMirror:
         semaphore: asyncio.Semaphore = request.app.state.semaphore
 
         async with semaphore:
-            max_retries = 2
-            for attempt in range(max_retries + 1):
+            for attempt in range(MAX_RETRIES + 1):
                 try:
-                    response = await self._send_request(request, telegram_url)
-                    return Response(
-                        content=response.content,
-                        status_code=response.status_code,
-                        media_type="application/json",
-                    )
+                    result = await self._send_request(request, telegram_url)
+
+                    # `_send_request` may return a starlette
+                    # JSONResponse when the incoming body cannot be parsed
+                    # (e.g. invalid JSON / malformed form). Return it
+                    # directly — do NOT access `.content`, which only
+                    # exists on httpx.Response and would raise AttributeError.
+                    if isinstance(result, JSONResponse):
+                        return result
+
+                    return self._forward_response(result)
+
                 except httpx.ConnectTimeout:
-                    if attempt < max_retries:
+                    if attempt < MAX_RETRIES:
+                        # exponential backoff with full jitter.
+                        delay = _compute_backoff(attempt)
                         logger.warning(
                             f"Connection timeout from {client_ip}, retry "
-                            f"{attempt + 1}/{max_retries} for {log_url}"
+                            f"{attempt + 1}/{MAX_RETRIES} for {log_url} "
+                            f"after {delay:.2f}s"
                         )
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(delay)
                         continue
                     logger.error(
                         f"Connection timeout from {client_ip} after "
-                        f"{max_retries + 1} attempts"
+                        f"{MAX_RETRIES + 1} attempts"
                     )
                     return self._send_error(
                         "Connection timeout: Telegram API is not reachable. "
@@ -347,6 +409,34 @@ class TelegramApiMirror:
         # Unreachable, kept for type checkers.
         return self._send_error("Unexpected error", 500)
 
+    def _forward_response(self, response: httpx.Response) -> Response:
+        """
+        Copy an upstream httpx response into a Starlette Response
+        while preserving important headers (Content-Type, Content-Disposition,
+        Retry-After).
+
+        Note: Content-Encoding is intentionally NOT forwarded — httpx has
+        already transparently decoded the body (it advertises
+        Accept-Encoding: gzip, deflate, br, zstd by default), so forwarding
+        the original Content-Encoding header would instruct the client to
+        decompress already-decompressed bytes.
+        """
+        passthrough_headers: Dict[str, str] = {}
+        for header in (
+            "content-type",
+            "content-disposition",
+            "retry-after",
+        ):
+            value = response.headers.get(header)
+            if value is not None:
+                passthrough_headers[header] = value
+
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=passthrough_headers,
+        )
+
     def _analyze_connect_error(self, exc: httpx.ConnectError) -> str:
         """Map a ConnectError to a human-readable diagnostic message."""
         err_str = str(exc).lower()
@@ -381,8 +471,14 @@ class TelegramApiMirror:
 
     async def _send_request(
         self, original_request: Request, telegram_url: str
-    ) -> httpx.Response:
-        """Forward the incoming request to Telegram and return the httpx response."""
+    ) -> Union[httpx.Response, JSONResponse]:
+        """
+        Forward the incoming request to Telegram and return the httpx response.
+
+        return type is now Union[httpx.Response, JSONResponse] to
+        reflect that parse errors are surfaced as starlette JSONResponse
+        objects (handled by the caller).
+        """
         client: httpx.AsyncClient = original_request.app.state.http_client
 
         # Preserve query string parameters (e.g. ?offset=... for getUpdates).
@@ -392,9 +488,12 @@ class TelegramApiMirror:
         files = []
         json_payload = None
         content: Optional[bytes] = None
+        # remember the client's Content-Type so it can be preserved
+        # when passing raw bytes through for unknown content types.
+        original_ct = original_request.headers.get("content-type", "")
 
         if original_request.method == "POST":
-            content_type = original_request.headers.get("content-type", "").lower()
+            content_type = original_ct.lower()
 
             if "application/json" in content_type:
                 raw_body = await original_request.body()
@@ -427,6 +526,8 @@ class TelegramApiMirror:
                         file_obj = getattr(value, "file", None)
                         if file_obj is not None:
                             try:
+                                # rewind before each attempt so
+                                # retries never send a truncated file.
                                 file_obj.seek(0)
                             except Exception:
                                 pass
@@ -485,7 +586,17 @@ class TelegramApiMirror:
             elif data:
                 response = await client.post(final_url, data=data)
             else:
-                response = await client.post(final_url, content=content)
+                # preserve the client's Content-Type when passing
+                # raw bytes (or an empty body) through to Telegram. Some
+                # endpoint behaviors depend on Content-Type being present.
+                raw_headers: Dict[str, str] = {}
+                if original_ct:
+                    raw_headers["Content-Type"] = original_ct
+                response = await client.post(
+                    final_url,
+                    content=content if content is not None else b"",
+                    headers=raw_headers,
+                )
 
         logger.debug(f"Response status: {response.status_code}")
         if response.status_code != 200:
@@ -522,6 +633,13 @@ async def lifespan(app: FastAPI):
     nets_str = ", ".join(str(net) for net in TRUSTED_NETWORKS)
     logger.info(f"Trusted proxy networks: {nets_str}")
     logger.info(f"Max request body size: {MAX_REQUEST_BODY_SIZE} bytes")
+
+    # log retry policy so operators can see what's active.
+    logger.info(
+        f"Retry policy: MAX_RETRIES={MAX_RETRIES}, "
+        f"RETRY_BASE_DELAY={RETRY_BASE_DELAY}s, "
+        f"RETRY_MAX_DELAY={RETRY_MAX_DELAY}s"
+    )
 
     timeout_config = httpx.Timeout(
         timeout=TIMEOUT,
@@ -574,15 +692,44 @@ async def lifespan(app: FastAPI):
 
 
 # ---------------- App ----------------
-app = FastAPI(title="Telegram API Gateway", lifespan=lifespan)
+# docs/openapi endpoints are opt-in to reduce attack surface.
+# Set ENABLE_DOCS=true to expose /docs, /redoc and /openapi.json.
+if ENABLE_DOCS:
+    app = FastAPI(
+        title="Telegram API Gateway",
+        version=VERSION,
+        lifespan=lifespan,
+    )
+else:
+    app = FastAPI(
+        title="Telegram API Gateway",
+        version=VERSION,
+        lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
 
 # CORS
+# allow_credentials=True combined with allow_origins=["*"] is
+# rejected by all modern browsers per the CORS spec. We validate the
+# combination and fall back to credentials=False with a warning, so
+# misconfiguration can't silently break clients.
+if CORS_ALLOW_CREDENTIALS and CORS_ALLOW_ORIGINS == ["*"]:
+    logger.warning(
+        "CORS: allow_credentials=True with allow_origins='*' is invalid per "
+        "spec and will be ignored by browsers. Falling back to "
+        "credentials=False. Set CORS_ALLOW_ORIGINS explicitly to enable "
+        "credentials."
+    )
+    CORS_ALLOW_CREDENTIALS = False
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Connection-Id"],
-    allow_credentials=True,
+    allow_credentials=CORS_ALLOW_CREDENTIALS,
 )
 
 # Middleware order: last added is outermost.
@@ -626,6 +773,12 @@ async def catch_all(request: Request, path: str):
 if __name__ == "__main__":
     import uvicorn
 
+    # uvicorn's own access log prints raw URL paths (including bot tokens).
+    # It is ALWAYS disabled here. Masked access logging is provided by
+    # MaskTokenMiddleware and controlled by DISABLE_ACCESS_LOG.
+    # Passing `access_log=False` prevents uvicorn's dictConfig() from
+    # re-enabling the handler after our module-level setLevel() call,
+    # which would otherwise leak raw tokens when running `python main.py`.
     if WORKERS > 1:
         # Multiple workers require the import-string form.
         # Run as a module: `python -m app.main` from the project root,
@@ -636,7 +789,7 @@ if __name__ == "__main__":
             port=PORT,
             workers=WORKERS,
             log_level=LOG_LEVEL.lower(),
-            access_log=not DISABLE_ACCESS_LOG,
+            access_log=False,
         )
     else:
         uvicorn.run(
@@ -644,5 +797,5 @@ if __name__ == "__main__":
             host="0.0.0.0",
             port=PORT,
             log_level=LOG_LEVEL.lower(),
-            access_log=not DISABLE_ACCESS_LOG,
+            access_log=False,
         )

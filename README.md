@@ -49,6 +49,13 @@ services:
       - TRUSTED_PROXIES=
       - MAX_CONCURRENT_REQUESTS=100
       - MAX_KEEPALIVE_CONNECTIONS=10
+      - MAX_REQUEST_BODY_SIZE=20971520
+      - MAX_RETRIES=2
+      - RETRY_BASE_DELAY=0.5
+      - RETRY_MAX_DELAY=5.0
+      - ENABLE_DOCS=false
+      - CORS_ALLOW_ORIGINS=*
+      - CORS_ALLOW_CREDENTIALS=false
     restart: always
     healthcheck:
       test: ["CMD-SHELL", "PORT=$${PORT:-8000}; curl -f http://localhost:$$PORT/health || exit 1"]
@@ -92,15 +99,23 @@ server {
 | `PORT` | Application port | `8000` |
 | `WORKERS` | Uvicorn workers count | `1` |
 | `LOG_LEVEL` | Logging level (critical, error, warning, info, debug, trace) | `info` |
-| `DISABLE_ACCESS_LOG` | Disable uvicorn access logs | `true` |
+| `DISABLE_ACCESS_LOG` | Disable access logs (tokens are always masked) | `true` |
 | `SOCKS_PROXY` | SOCKS5 proxy (format: ip:port) | (empty) |
 | `TIMEOUT` | Request timeout in seconds | `30` |
 | `CONNECT_TIMEOUT` | Connection timeout in seconds | `10` |
-| `USER_AGENT` | Custom User-Agent header | `PYTGW/1.0` |
+| `USER_AGENT` | Custom User-Agent header | `PYTGW/1.2.1` |
 | `X_CONNECTION_ID` | Security header that must be present in the client request | (empty) |
 | `TRUSTED_PROXIES` | Trusted proxies comma-separated allowed to set forwarded host, proto, client ip headers | (empty) |
 | `MAX_CONCURRENT_REQUESTS` | How many simultaneous outgoing requests to Telegram | `200` |
 | `MAX_KEEPALIVE_CONNECTIONS` | How many keep-alive connections to keep | `50` |
+| `MAX_REQUEST_BODY_SIZE` | Maximum allowed request body size in bytes (default 20 MiB) | `20971520` |
+| `MAX_RETRIES` | Retries on connect timeouts | `2` |
+| `RETRY_BASE_DELAY` | Base delay for exponential backoff in seconds | `0.5` |
+| `RETRY_MAX_DELAY` | Upper bound for backoff delay in seconds | `5.0` |
+| `ENABLE_DOCS` | Expose /docs, /redoc, /openapi.json (disabled by default for security) | `false` |
+| `CORS_ALLOW_ORIGINS` | Comma-separated list of allowed origins, or `*` | `*` |
+| `CORS_ALLOW_CREDENTIALS` | Allow CORS credentials (must be `false` with `*` origins) | `false` |
+| `PYTGW_VERSION` | Override reported version (used by `/health`) | `1.2.1` |
 
 ## Testing
 ```bash
