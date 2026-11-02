@@ -103,7 +103,7 @@ server {
 | `SOCKS_PROXY` | SOCKS5 proxy (format: ip:port) | (empty) |
 | `TIMEOUT` | Request timeout in seconds | `30` |
 | `CONNECT_TIMEOUT` | Connection timeout in seconds | `10` |
-| `USER_AGENT` | Custom User-Agent header | `PYTGW/1.2.1` |
+| `USER_AGENT` | Custom User-Agent header | `PYTGW/1.0` |
 | `X_CONNECTION_ID` | Security header that must be present in the client request | (empty) |
 | `TRUSTED_PROXIES` | Trusted proxies comma-separated allowed to set forwarded host, proto, client ip headers | (empty) |
 | `MAX_CONCURRENT_REQUESTS` | How many simultaneous outgoing requests to Telegram | `200` |
@@ -115,7 +115,6 @@ server {
 | `ENABLE_DOCS` | Expose /docs, /redoc, /openapi.json (disabled by default for security) | `false` |
 | `CORS_ALLOW_ORIGINS` | Comma-separated list of allowed origins, or `*` | `*` |
 | `CORS_ALLOW_CREDENTIALS` | Allow CORS credentials (must be `false` with `*` origins) | `false` |
-| `PYTGW_VERSION` | Override reported version (used by `/health`) | `1.2.1` |
 
 ## Testing
 ```bash
